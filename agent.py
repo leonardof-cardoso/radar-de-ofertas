@@ -9,6 +9,8 @@ import io
 import json
 import os
 import re
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -83,7 +85,11 @@ def queries(item):
 
 
 def search(q):
-    data = json.loads(get("https://api.promobit.com.br/search?q=" + urllib.parse.quote(q)))
+    try:
+        data = json.loads(get("https://api.promobit.com.br/search?q=" + urllib.parse.quote(q)))
+    except Exception as e:  # uma busca ruim não derruba as outras
+        print(f"busca '{q}' falhou: {e}")
+        return [], []
     return data.get("active_offers") or [], data.get("finished_offers") or []
 
 
@@ -139,7 +145,14 @@ def telegram(method, fields, files=None):
             body += content + b"\r\n"
         body += f"--{boundary}--\r\n".encode()
         req = urllib.request.Request(url, data=body, headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
-    urllib.request.urlopen(req, timeout=60)
+    for tentativa in range(3):
+        try:
+            return urllib.request.urlopen(req, timeout=60)
+        except urllib.error.HTTPError as e:
+            if e.code != 429 or tentativa == 2:
+                raise
+            espera = json.loads(e.read()).get("parameters", {}).get("retry_after", 5)
+            time.sleep(espera)  # Telegram pediu calma: espera e tenta de novo
 
 
 def enviar(oferta, mensagem, super_promo):
@@ -189,7 +202,10 @@ def main():
     if candidatas and not primeira_vez:  # sem estado salvo: só registra o que já existe, não reenvia
         for r in avaliar(itens, candidatas):
             if r["enviar"] and r["id"] in ofertas:
-                enviar(ofertas[r["id"]], r["mensagem"], r["super"])
+                try:
+                    enviar(ofertas[r["id"]], r["mensagem"], r["super"])
+                except Exception as e:  # uma oferta com problema não impede as outras
+                    print(f"envio da oferta {r['id']} falhou: {e}")
     vistos.update(ofertas)  # avaliadas uma vez só, para não gastar token de novo
 
     estado["vistos"] = sorted(vistos)[-3000:]
