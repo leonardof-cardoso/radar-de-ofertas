@@ -17,6 +17,9 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -r requirements.txt
+      - name: Testes
+        run: python agent.py --teste
+        env: { TELEGRAM_TOKEN: x, TELEGRAM_CHAT_ID: x, SHEET_CSV_URL: x }
       # estado (ofertas já vistas + histórico de preços) fica no cache do Actions, fora do repositório
       - uses: actions/cache/restore@v4
         with:
