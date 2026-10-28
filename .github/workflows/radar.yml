@@ -1,0 +1,37 @@
+name: Radar de Ofertas
+
+on:
+  schedule:
+    - cron: "*/20 * * * *"  # a cada 20 minutos, 24h
+  workflow_dispatch:
+
+concurrency: radar
+
+jobs:
+  buscar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      # estado (ofertas já vistas + histórico de preços) fica no cache do Actions, fora do repositório
+      - uses: actions/cache/restore@v4
+        with:
+          path: estado.json
+          key: estado-${{ github.run_id }}
+          restore-keys: estado-
+      - run: python agent.py
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SHEET_CSV_URL: ${{ secrets.SHEET_CSV_URL }}
+          MENCOES: ${{ secrets.MENCOES }}
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: estado.json
+          key: estado-${{ github.run_id }}
