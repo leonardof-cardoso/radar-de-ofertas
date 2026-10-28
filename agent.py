@@ -10,6 +10,7 @@ import json
 import os
 import re
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -82,6 +83,29 @@ def queries(item):
         return [nome]
     # modelo completo (texto longo) já é a busca; marca curta vira "item marca"
     return [m if len(m) > 25 else f"{nome} {m}" for m in marcas]
+
+
+def normalizar(texto):
+    sem_acento = unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode()
+    return re.sub(r"[^a-z0-9]+", " ", sem_acento.lower()).strip()
+
+
+PALAVRAS_VAZIAS = {"de", "da", "do", "e", "com", "para", "ate", "a", "o"}
+
+
+def palavras(item):
+    texto = normalizar(item["Item"] + " " + item.get("Modelo / Marca", ""))
+    return {p for p in texto.split() if len(p) >= 2 and p not in PALAVRAS_VAZIAS}
+
+
+def parece_o_item(titulo, item):
+    """Pré-filtro grátis: o título precisa citar o item ou a marca, senão nem gasta token com ele."""
+    return bool(palavras(item) & set(normalizar(titulo).split()))
+
+
+def impressao(o):
+    """Mesma oferta repostada (outro ID, mesmo produto e preço) tem a mesma impressão digital."""
+    return f"{normalizar(o['offer_title'])[:60]}|{round(o['offer_price'])}"
 
 
 def search(q):
@@ -174,6 +198,7 @@ def main():
     primeira_vez = not os.path.exists(ESTADO)
     estado = {"vistos": [], "historico": {}} if primeira_vez else json.load(open(ESTADO, encoding="utf-8"))
     vistos = set(estado["vistos"])
+    enviados = set(estado.get("enviados", []))
     agora = datetime.now(timezone.utc)
     itens = load_items()
     candidatas, ofertas = [], {}
@@ -188,7 +213,9 @@ def main():
                 if registro not in hist:
                     hist.append(registro)
             for o in ativas:
-                if o["offer_id"] in vistos or o["offer_id"] in ofertas or agora - published(o) > MAX_IDADE:
+                if (o["offer_id"] in vistos or o["offer_id"] in ofertas or agora - published(o) > MAX_IDADE
+                        or impressao(o) in enviados or not parece_o_item(o["offer_title"], item)):
+                    vistos.add(o["offer_id"])
                     continue
                 ofertas[o["offer_id"]] = o
                 candidatas.append({
@@ -202,16 +229,33 @@ def main():
     if candidatas and not primeira_vez:  # sem estado salvo: só registra o que já existe, não reenvia
         for r in avaliar(itens, candidatas):
             if r["enviar"] and r["id"] in ofertas:
+                if impressao(ofertas[r["id"]]) in enviados:
+                    continue  # repost do mesmo produto na mesma execução
                 try:
                     enviar(ofertas[r["id"]], r["mensagem"], r["super"])
+                    enviados.add(impressao(ofertas[r["id"]]))
                 except Exception as e:  # uma oferta com problema não impede as outras
                     print(f"envio da oferta {r['id']} falhou: {e}")
     vistos.update(ofertas)  # avaliadas uma vez só, para não gastar token de novo
 
     estado["vistos"] = sorted(vistos)[-3000:]
+    estado["enviados"] = sorted(enviados)[-1000:]
     with open(ESTADO, "w", encoding="utf-8") as f:
         json.dump(estado, f, ensure_ascii=False, indent=1)
 
 
+
+
+def _teste():
+    item = {"Item": "Máquina de Lavar", "Modelo / Marca": "Samsung / LG / Midea"}
+    assert parece_o_item("Lavadora LG Vc5 12kg Branca", item)
+    assert not parece_o_item("SELEÇÃO CASA & ELETRO: Geladeira", {"Item": "Televisão", "Modelo / Marca": ""})
+    assert queries({"Item": "Air Fryer", "Modelo / Marca": "Mondial / WAP"}) == ["Air Fryer Mondial", "Air Fryer WAP"]
+    a = {"offer_title": "Air Fryer Mondial 4L", "offer_price": 224.0}
+    assert impressao(a) == impressao({"offer_title": "AIR FRYER MONDIAL 4l", "offer_price": 224.3})
+    print("testes ok")
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+    _teste() if "--teste" in sys.argv else main()
