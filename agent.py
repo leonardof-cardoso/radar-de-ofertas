@@ -179,14 +179,33 @@ def telegram(method, fields, files=None):
             time.sleep(espera)  # Telegram pediu calma: espera e tenta de novo
 
 
-def enviar(oferta, mensagem, super_promo):
+def grafico(historico):
+    """Link de um gráfico do histórico de preços (QuickChart gera a imagem, sem dependência nenhuma)."""
+    if len(historico) < 2:
+        return None
+    pontos = sorted(historico)[-30:]
+    config = {
+        "type": "line",
+        "data": {"labels": [d[5:] for d, _, _ in pontos],
+                 "datasets": [{"label": "Preço (R$)", "data": [p for _, p, _ in pontos], "fill": False}]},
+    }
+    return "https://quickchart.io/chart?c=" + urllib.parse.quote(json.dumps(config, separators=(",", ":")))
+
+
+def enviar(oferta, mensagem, super_promo, historico):
     link = f"https://www.promobit.com.br/oferta/{oferta['offer_slug']}/"
-    texto = html.escape(mensagem) + f'\n🔗 <a href="{link}">Ver oferta</a>'
+    texto = html.escape(mensagem)
+    if oferta.get("offer_coupon"):
+        texto += f"\n🎟️ Cupom: <code>{html.escape(oferta['offer_coupon'])}</code>"
     if super_promo:
         marcas = " ".join(f'<a href="tg://user?id={uid}">{html.escape(nome)}</a>' for uid, nome in MENCOES)
         marcas += "".join(f" {m}" for m in USERNAMES)
         texto = f"🚨🚨 SUPER PROMOÇÃO 🚨🚨 {marcas}\n\n" + texto
-    fields = {"chat_id": TELEGRAM_CHAT_ID, "caption": texto[:1024], "parse_mode": "HTML"}
+    botoes = [{"text": "🛒 Ver oferta", "url": link}]
+    if grafico(historico):
+        botoes.append({"text": "📈 Histórico de preços", "url": grafico(historico)})
+    fields = {"chat_id": TELEGRAM_CHAT_ID, "caption": texto[:1024], "parse_mode": "HTML",
+              "reply_markup": json.dumps({"inline_keyboard": [botoes]})}
     png = print_oferta(link)
     if png:
         telegram("sendPhoto", fields, {"photo": ("oferta.png", png)})
@@ -218,6 +237,7 @@ def main():
                     vistos.add(o["offer_id"])
                     continue
                 ofertas[o["offer_id"]] = o
+                o["_item"] = nome
                 candidatas.append({
                     "id": o["offer_id"], "item": nome, "titulo": o["offer_title"], "loja": o["store_name"],
                     "preco": o["offer_price"], "preco_antigo": o["offer_old_price"] or None,
@@ -232,7 +252,8 @@ def main():
                 if impressao(ofertas[r["id"]]) in enviados:
                     continue  # repost do mesmo produto na mesma execução
                 try:
-                    enviar(ofertas[r["id"]], r["mensagem"], r["super"])
+                    oferta = ofertas[r["id"]]
+                    enviar(oferta, r["mensagem"], r["super"], estado["historico"][oferta["_item"]])
                     enviados.add(impressao(ofertas[r["id"]]))
                 except Exception as e:  # uma oferta com problema não impede as outras
                     print(f"envio da oferta {r['id']} falhou: {e}")
@@ -253,6 +274,8 @@ def _teste():
     assert queries({"Item": "Air Fryer", "Modelo / Marca": "Mondial / WAP"}) == ["Air Fryer Mondial", "Air Fryer WAP"]
     a = {"offer_title": "Air Fryer Mondial 4L", "offer_price": 224.0}
     assert impressao(a) == impressao({"offer_title": "AIR FRYER MONDIAL 4l", "offer_price": 224.3})
+    assert grafico([["2026-10-01", 100, "x"]]) is None
+    assert grafico([["2026-10-01", 100, "x"], ["2026-10-02", 90, "x"]]).startswith("https://quickchart.io/")
     print("testes ok")
 
 
