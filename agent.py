@@ -32,7 +32,8 @@ MAX_IDADE = timedelta(days=3)
 
 SYSTEM = """Você filtra ofertas do Promobit para um casal montando a casa nova no Brasil.
 Recebe a lista de itens que eles querem (com marca/modelo preferido, prioridade e preço máximo opcional)
-e ofertas candidatas, cada uma com o histórico de preços já visto para aquele item.
+e ofertas candidatas, cada uma com um resumo do histórico de preços já visto para aquele item
+(menor, mediana, quantas vezes apareceu, últimos registros) e o desconto real contra a mediana.
 
 Para cada candidata decida:
 - enviar: true só se o produto é de fato o item procurado (ex.: "Hack" é rack de sala, não hacking),
@@ -106,6 +107,22 @@ def parece_o_item(titulo, item):
 def impressao(o):
     """Mesma oferta repostada (outro ID, mesmo produto e preço) tem a mesma impressão digital."""
     return f"{normalizar(o['offer_title'])[:60]}|{round(o['offer_price'])}"
+
+
+def resumo(historico, preco):
+    """Estatística pronta para a IA: menos tokens e nada de conta de cabeça."""
+    precos = sorted(p for _, p, _ in historico if p)
+    if not precos:
+        return {"vezes_visto": 0}
+    mediana = precos[len(precos) // 2]
+    return {
+        "vezes_visto": len(precos),
+        "menor": precos[0],
+        "mediana": mediana,
+        "desconto_vs_mediana_pct": round((1 - preco / mediana) * 100),
+        "e_o_menor_ja_visto": preco <= precos[0],
+        "ultimos": [f"{d} R$ {p} {t[:40]}" for d, p, t in sorted(historico)[-5:]],
+    }
 
 
 def search(q):
@@ -241,7 +258,7 @@ def main():
                 candidatas.append({
                     "id": o["offer_id"], "item": nome, "titulo": o["offer_title"], "loja": o["store_name"],
                     "preco": o["offer_price"], "preco_antigo": o["offer_old_price"] or None,
-                    "cupom": o["offer_coupon"], "historico": sorted(hist)[-15:],
+                    "cupom": o["offer_coupon"], "historico": resumo(hist, o["offer_price"]),
                 })
         estado["historico"][nome] = sorted(hist)[-50:]
 
@@ -276,6 +293,8 @@ def _teste():
     assert impressao(a) == impressao({"offer_title": "AIR FRYER MONDIAL 4l", "offer_price": 224.3})
     assert grafico([["2026-10-01", 100, "x"]]) is None
     assert grafico([["2026-10-01", 100, "x"], ["2026-10-02", 90, "x"]]).startswith("https://quickchart.io/")
+    r = resumo([["2026-10-01", 100, "a"], ["2026-10-02", 200, "b"], ["2026-10-03", 300, "c"]], 100)
+    assert r["mediana"] == 200 and r["desconto_vs_mediana_pct"] == 50 and r["e_o_menor_ja_visto"]
     print("testes ok")
 
 
