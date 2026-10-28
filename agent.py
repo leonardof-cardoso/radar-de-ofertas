@@ -190,7 +190,7 @@ def main():
         for r in avaliar(itens, candidatas):
             if r["enviar"] and r["id"] in ofertas:
                 enviar(ofertas[r["id"]], r["mensagem"], r["super"])
-        vistos.update(ofertas)  # avaliadas uma vez só, para não gastar token de novo
+    vistos.update(ofertas)  # avaliadas uma vez só, para não gastar token de novo
 
     estado["vistos"] = sorted(vistos)[-3000:]
     with open(ESTADO, "w", encoding="utf-8") as f:
