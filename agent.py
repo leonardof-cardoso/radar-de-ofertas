@@ -381,7 +381,10 @@ def ofertas_comparadores(alvo):
                 break
         for h in hits:
             loja = h.get("merchantName") or (h.get("bestOffer") or {}).get("merchantName")
-            if normalizar(modelo) not in normalizar(h.get("name", "")) or not serve(h["name"], alvo) or not confiavel(loja):
+            # só anúncio de loja ("offer"): a página agrupada do comparador ("product") mistura as cores
+            # e mostra o preço da mais barata, que pode ser a branca
+            if (h.get("type") != "offer" or normalizar(modelo) not in normalizar(h.get("name", ""))
+                    or not serve(h["name"], alvo) or not confiavel(loja)):
                 continue
             encontradas.append({"loja": loja, "preco": float(h["price"]), "titulo": h["name"],
                                 "link": site + h["url"],
