@@ -266,7 +266,7 @@ def reais(valor):
 LOJAS_CONFIAVEIS = {
     "amazon", "magazine luiza", "magalu", "fast shop", "casas bahia", "ponto", "extra",
     "carrefour", "americanas", "submarino", "shoptime", "mercado livre", "leroy merlin", "kabum",
-    "midea", "loja midea",
+    "midea", "loja midea", "shopee",
 }
 
 # Um link só vai para o grupo se apontar para um destes domínios (ou subdomínio deles).
@@ -274,7 +274,7 @@ DOMINIOS_CONFIAVEIS = {
     "zoom.com.br", "buscape.com.br", "promobit.com.br", "amazon.com.br", "magazineluiza.com.br", "magalu.com",
     "fastshop.com.br", "casasbahia.com.br", "pontofrio.com.br", "extra.com.br", "carrefour.com.br",
     "americanas.com.br", "submarino.com.br", "shoptime.com.br", "mercadolivre.com.br", "leroymerlin.com.br",
-    "kabum.com.br", "midea.com.br", "midea.com",
+    "kabum.com.br", "midea.com.br", "midea.com", "shopee.com.br",
 }
 
 
@@ -399,7 +399,9 @@ def ofertas_promobit(alvo):
         return []
     agora = datetime.now(timezone.utc)
     encontradas = []
-    for o in search(cfg["q"])[0]:
+    consultas = [cfg["q"]] if isinstance(cfg["q"], str) else cfg["q"]
+    ativas = {o["offer_id"]: o for q in consultas for o in search(q)[0]}  # várias buscas, sem repetir oferta
+    for o in ativas.values():
         t = normalizar(o["offer_title"])
         if (agora - published(o) > MAX_IDADE or not all(normalizar(p) in t for p in cfg.get("todos", []))
                 or not any(normalizar(p) in t for p in cfg.get("algum", [""]))
@@ -600,6 +602,7 @@ def _teste():
     assert preco_amazon('x "priceAmount":1899.00,"y"') == 1899.0 and preco_amazon("sem preço") is None
     assert reais(1599.9) == "R$ 1.599,90"
     assert confiavel("Magazine Luiza") and confiavel("Midea ") and not confiavel("Webcontinental")
+    assert confiavel("Shopee") and dominio_confiavel("shopee.com.br")
     assert dominio_confiavel("www.amazon.com.br") and not dominio_confiavel("amazon.com.br.golpe.xyz")
     assert testar_link("http://www.amazon.com.br/dp/X")[0] is False  # sem HTTPS
     assert testar_link("https://amaz0n-ofertas.xyz/dp/X")[0] is False  # domínio desconhecido
