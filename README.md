@@ -25,6 +25,23 @@ flowchart LR
 - **Sem repetição:** reposts da mesma oferta (outro ID, mesmo produto e preço) são ignorados.
 - **Alertas que chamam atenção:** super promoções (menor preço já visto ou desconto real alto) marcam todos do grupo.
 
+## Monitor de preço alvo
+
+Além da lista, o radar vigia produtos específicos e avisa (marcando todos) quando uma loja conhecida fica abaixo do valor definido. Não usa IA.
+
+- **Fontes:** Zoom (com Buscapé de reserva), Promobit e páginas de produto da Amazon.
+- **Filtros:** só lojas de uma lista de grandes redes; termos proibidos (cor, voltagem, kit) descartam a oferta.
+- **Testador de link:** antes de enviar, cada link precisa ser HTTPS, apontar para um domínio conhecido, não constar como malicioso no DNS de segurança da Cloudflare (`security.cloudflare-dns.com`) e estar no ar. Link reprovado não é enviado.
+- **Imagem:** print da página; se a loja bloquear o navegador automático, vai a foto do produto.
+- **Saúde:** se o radar falhar por 3 rodadas seguidas, ele avisa no grupo, e avisa de novo quando voltar.
+
+```json
+[{"nome": "Lava-louças X", "max": 1600, "excluir": ["branc", "220", "kit"],
+  "modelos": ["CODIGO1", "CODIGO2"],
+  "promobit": {"q": "lava louças marca", "todos": ["marca"], "algum": ["pret", "cinza"]},
+  "amazon": ["https://www.amazon.com.br/dp/ASIN"]}]
+```
+
 ## Exemplo de alerta
 
 ```
@@ -51,6 +68,7 @@ flowchart LR
 | `TELEGRAM_CHAT_ID` | ID do grupo |
 | `SHEET_CSV_URL` | `https://docs.google.com/spreadsheets/d/<ID>/export?format=csv` |
 | `MENCOES` | Quem marcar nas super promoções: `id:Nome,@username` |
+| `MONITORES` | Produtos com preço alvo (JSON acima) |
 
 O estado (ofertas vistas e histórico) fica no cache do GitHub Actions, fora do repositório.
 

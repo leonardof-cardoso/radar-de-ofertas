@@ -10,6 +10,7 @@ concurrency: radar
 jobs:
   buscar:
     runs-on: ubuntu-latest
+    timeout-minutes: 15  # execução travada não segura a fila
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

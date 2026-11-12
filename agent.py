@@ -9,7 +9,9 @@ import io
 import json
 import os
 import re
+import sys
 import time
+import traceback
 import unicodedata
 import urllib.error
 import urllib.parse
@@ -159,17 +161,30 @@ def avaliar(itens, candidatas):
     return json.loads(text)["ofertas"]
 
 
+BLOQUEIOS = ("403 error", "request could not be satisfied", "access denied", "acesso negado", "captcha",
+             "digite os caracteres", "nao sou um robo", "are you a robot", "pagina indisponivel", "unusual traffic")
+
+
+def bloqueio_na_pagina(status, texto):
+    """A loja barrou o navegador automático? Então o print não presta (sairia uma tela de erro)."""
+    return status >= 400 or any(b in normalizar(texto) for b in BLOQUEIOS)
+
+
 def print_oferta(url):
-    """Print da página da oferta, como se alguém entrasse e tirasse um screenshot."""
+    """Print da página da oferta, como se alguém entrasse e tirasse um screenshot. None se a loja bloquear."""
     try:
         from playwright.sync_api import sync_playwright
         with sync_playwright() as p:
             browser = p.chromium.launch(channel="chrome")  # Chrome já vem instalado no runner do GitHub
             page = browser.new_page(viewport={"width": 430, "height": 820}, device_scale_factor=2, locale="pt-BR")
-            page.goto(url, wait_until="domcontentloaded", timeout=45000)
-            page.wait_for_timeout(4000)  # deixa imagens e preço aparecerem
-            png = page.screenshot()
+            resposta = page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            page.wait_for_timeout(6000)  # deixa redirecionar, e imagens e preço aparecerem
+            texto = page.title() + " " + page.inner_text("body")[:3000]
+            bloqueado = bloqueio_na_pagina(resposta.status if resposta else 200, texto)
+            png = None if bloqueado else page.screenshot()
             browser.close()
+            if bloqueado:
+                print("print bloqueado pela loja, usando foto do produto")
             return png
     except Exception as e:  # ponytail: sem print, cai para a foto do produto
         print(f"print falhou ({e}), usando foto do produto")
@@ -220,9 +235,13 @@ def marcar_todos():
 
 def enviar(oferta, mensagem, super_promo, historico):
     link = f"https://www.promobit.com.br/oferta/{oferta['offer_slug']}/"
+    aprovado, laudo = testar_link(link)
+    if not aprovado:
+        raise RuntimeError(f"link reprovado no teste: {laudo}")
     texto = html.escape(mensagem)
     if oferta.get("offer_coupon"):
         texto += f"\n🎟️ Cupom: <code>{html.escape(oferta['offer_coupon'])}</code>"
+    texto += f"\n🔒 Link testado: {html.escape(laudo)}"
     if super_promo:
         texto = f"🚨🚨 SUPER PROMOÇÃO 🚨🚨 {marcar_todos()}\n\n" + texto
     botoes = [{"text": "🛒 Ver oferta", "url": link}]
@@ -230,11 +249,7 @@ def enviar(oferta, mensagem, super_promo, historico):
         botoes.append({"text": "📈 Histórico de preços", "url": grafico(historico)})
     fields = {"chat_id": TELEGRAM_CHAT_ID, "caption": texto[:1024], "parse_mode": "HTML",
               "reply_markup": json.dumps({"inline_keyboard": [botoes]})}
-    png = print_oferta(link)
-    if png:
-        telegram("sendPhoto", fields, {"photo": ("oferta.png", png)})
-    else:
-        telegram("sendPhoto", {**fields, "photo": "https://i.promobit.com.br/400" + oferta["offer_photo"]})
+    enviar_com_imagem(fields, link, "https://i.promobit.com.br/400" + oferta["offer_photo"])
 
 
 def preco_amazon(pagina):
@@ -247,16 +262,79 @@ def reais(valor):
     return f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
-# Só alerta de lojas grandes e conhecidas (nome como aparece no Zoom/Buscapé, sem acento e minúsculo).
+# Só alerta de lojas grandes e conhecidas (nome como aparece no Zoom/Buscapé/Promobit, sem acento e minúsculo).
 LOJAS_CONFIAVEIS = {
     "amazon", "magazine luiza", "magalu", "fast shop", "casas bahia", "ponto", "extra",
     "carrefour", "americanas", "submarino", "shoptime", "mercado livre", "leroy merlin", "kabum",
     "midea", "loja midea",
 }
 
+# Um link só vai para o grupo se apontar para um destes domínios (ou subdomínio deles).
+DOMINIOS_CONFIAVEIS = {
+    "zoom.com.br", "buscape.com.br", "promobit.com.br", "amazon.com.br", "magazineluiza.com.br", "magalu.com",
+    "fastshop.com.br", "casasbahia.com.br", "pontofrio.com.br", "extra.com.br", "carrefour.com.br",
+    "americanas.com.br", "submarino.com.br", "shoptime.com.br", "mercadolivre.com.br", "leroymerlin.com.br",
+    "kabum.com.br", "midea.com.br", "midea.com",
+}
+
 
 def confiavel(loja):
     return normalizar(loja or "") in LOJAS_CONFIAVEIS
+
+
+def dominio_confiavel(host):
+    host = (host or "").lower()
+    return any(host == d or host.endswith("." + d) for d in DOMINIOS_CONFIAVEIS)
+
+
+def bloqueado_cloudflare(host):
+    """Consulta o DNS de segurança da Cloudflare (1.1.1.2): domínio de malware/phishing volta como 0.0.0.0.
+
+    Devolve True (bloqueado), False (limpo) ou None (não deu para consultar).
+    """
+    try:
+        req = urllib.request.Request(
+            "https://security.cloudflare-dns.com/dns-query?type=A&name=" + urllib.parse.quote(host),
+            headers={"accept": "application/dns-json"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            resposta = json.loads(r.read())
+    except Exception as e:
+        print(f"cloudflare não respondeu para {host}: {e}")
+        return None
+    censurado = any("Censored" in c for c in resposta.get("Comment", []))
+    return censurado or any(a.get("data") == "0.0.0.0" for a in resposta.get("Answer", []))
+
+
+def testar_link(url):
+    """Testador de link: só passa HTTPS, em domínio conhecido, sem alerta da Cloudflare e com a página no ar.
+
+    Devolve (aprovado, laudo). O laudo vai na mensagem do grupo.
+    """
+    partes = urllib.parse.urlparse(url)
+    if partes.scheme != "https":
+        return False, "link sem HTTPS"
+    if not dominio_confiavel(partes.hostname):
+        return False, f"domínio desconhecido ({partes.hostname})"
+    seguranca = bloqueado_cloudflare(partes.hostname)
+    if seguranca:
+        return False, f"Cloudflare marca {partes.hostname} como malicioso"
+    laudo = "HTTPS · domínio conhecido · " + ("Cloudflare sem alerta" if seguranca is False else "Cloudflare fora do ar")
+    for tentativa in range(2):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=30) as r:
+                destino = urllib.parse.urlparse(r.geturl())
+                if destino.scheme != "https" or not dominio_confiavel(destino.hostname):
+                    return False, f"link redireciona para fora ({destino.hostname})"
+                return True, laudo + " · página no ar"
+        except urllib.error.HTTPError as e:
+            if e.code in (403, 429, 503):  # loja barrando robô: o domínio é bom, mas não deu para abrir a página
+                return True, laudo + " · loja não deixou conferir a página"
+            if tentativa:
+                return False, f"página fora do ar (erro {e.code})"
+        except Exception as e:
+            if tentativa:
+                return False, f"página não abriu ({e})"
+        time.sleep(3)
 
 
 def get_com_retry(url, nome):
@@ -269,90 +347,143 @@ def get_com_retry(url, nome):
     return None
 
 
+def serve(titulo, alvo):
+    """A oferta não pode ter nada da lista de exclusão (cor branca, 220V, kit...)."""
+    t = normalizar(titulo)
+    return not any(normalizar(p) in t for p in alvo.get("excluir", []))
+
+
 def ofertas_amazon(alvo):
-    pagina = get_com_retry(alvo["url"], alvo["nome"])
-    preco = preco_amazon(pagina) if pagina else None
-    if preco is None:
-        return []
-    foto = re.search(r'data-old-hires="([^"]+)"', pagina)
-    return [{"loja": "Amazon", "preco": preco, "link": alvo["url"], "foto": foto and foto.group(1)}]
-
-
-def ofertas_zoom(alvo):
-    """Todas as ofertas do modelo no Zoom (agrega dezenas de lojas), já sem cor proibida e só de loja confiável."""
-    pagina = get_com_retry("https://www.zoom.com.br/search?q=" + urllib.parse.quote(alvo["busca"]), alvo["nome"])
-    if not pagina:
-        return []
-    m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', pagina, re.S)
-    hits = json.loads(m.group(1))["props"]["initialReduxState"]["hits"]["hits"] if m else []
-    proibidas = [normalizar(p) for p in alvo.get("excluir", [])]
+    """Preço direto nas páginas de produto da Amazon."""
     encontradas = []
-    for h in hits:
-        nome = normalizar(h.get("name", ""))
-        loja = h.get("merchantName") or (h.get("bestOffer") or {}).get("merchantName")
-        if normalizar(alvo["busca"]) not in nome or any(p in nome for p in proibidas) or not confiavel(loja):
+    for url in alvo.get("amazon", []):
+        pagina = get_com_retry(url, alvo["nome"])
+        preco = preco_amazon(pagina) if pagina else None
+        if preco is None:
             continue
-        encontradas.append({"loja": loja, "preco": float(h["price"]), "titulo": h["name"],
-                            "link": "https://www.zoom.com.br" + h["url"], "foto": h.get("image")})
+        foto = re.search(r'data-old-hires="([^"]+)"', pagina)
+        encontradas.append({"loja": "Amazon", "preco": preco, "link": url, "foto": foto and foto.group(1)})
     return encontradas
 
 
+def ofertas_comparadores(alvo):
+    """Ofertas de cada código de modelo no Zoom; se o Zoom falhar, tenta o Buscapé (mesmo formato)."""
+    encontradas = []
+    for modelo in alvo.get("modelos", []):
+        for site in ("https://www.zoom.com.br", "https://www.buscape.com.br"):
+            pagina = get_com_retry(f"{site}/search?q=" + urllib.parse.quote(modelo), alvo["nome"])
+            m = pagina and re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', pagina, re.S)
+            try:
+                hits = json.loads(m.group(1))["props"]["initialReduxState"]["hits"]["hits"] if m else []
+            except (KeyError, ValueError):
+                hits = []
+            if hits:
+                break
+        for h in hits:
+            loja = h.get("merchantName") or (h.get("bestOffer") or {}).get("merchantName")
+            if normalizar(modelo) not in normalizar(h.get("name", "")) or not serve(h["name"], alvo) or not confiavel(loja):
+                continue
+            encontradas.append({"loja": loja, "preco": float(h["price"]), "titulo": h["name"],
+                                "link": site + h["url"],
+                                "foto": re.sub(r"_\d+_\d+\.", "_600_600.", h.get("image") or "") or None})
+    return encontradas
+
+
+def ofertas_promobit(alvo):
+    """Promoções recentes postadas no Promobit (pega cupom e oferta relâmpago que comparador não mostra)."""
+    cfg = alvo.get("promobit")
+    if not cfg:
+        return []
+    agora = datetime.now(timezone.utc)
+    encontradas = []
+    for o in search(cfg["q"])[0]:
+        t = normalizar(o["offer_title"])
+        if (agora - published(o) > MAX_IDADE or not all(normalizar(p) in t for p in cfg.get("todos", []))
+                or not any(normalizar(p) in t for p in cfg.get("algum", [""]))
+                or not serve(o["offer_title"], alvo) or not confiavel(o["store_name"])):
+            continue
+        encontradas.append({"loja": o["store_name"].strip(), "preco": float(o["offer_price"]), "titulo": o["offer_title"],
+                            "link": f"https://www.promobit.com.br/oferta/{o['offer_slug']}/",
+                            "foto": "https://i.promobit.com.br/400" + o["offer_photo"], "cupom": o.get("offer_coupon")})
+    return encontradas
+
+
+def enviar_com_imagem(fields, link, foto):
+    """Print da página; se a loja bloquear o print, foto do produto; sem foto, só o texto."""
+    imagem = print_oferta(link)
+    if not imagem and foto:
+        try:  # baixa a foto aqui: o Telegram não consegue buscar imagem de alguns sites
+            with urllib.request.urlopen(urllib.request.Request(foto, headers=UA), timeout=30) as r:
+                imagem = r.read()
+        except Exception as e:
+            print(f"foto do produto não baixou ({e}), enviando só o texto")
+    if imagem:
+        telegram("sendPhoto", fields, {"photo": ("oferta.png", imagem)})
+    else:
+        telegram("sendMessage", {k: v for k, v in fields.items() if k != "caption"} | {"text": fields["caption"]})
+
+
 def alertar(alvo, oferta, hist):
+    aprovado, laudo = testar_link(oferta["link"])
+    if not aprovado:
+        raise RuntimeError(f"link reprovado no teste: {laudo}")
     precos = [p for _, p, _ in hist]
     texto = (f"🚨🎯 PREÇO ALVO ATINGIDO 🎯🚨 {marcar_todos()}\n\n"
              f"🔥 {html.escape(oferta.get('titulo') or alvo['nome'])}\n"
              f"💰 Agora: <b>{reais(oferta['preco'])}</b> na {html.escape(oferta['loja'])} "
              f"(alvo: abaixo de {reais(alvo['max'])})\n"
-             f"📉 Histórico: menor {reais(min(precos))} · maior {reais(max(precos))} · {len(precos)} preços registrados\n"
-             f"✅ Loja confiável e abaixo do preço que vocês querem pagar. Corre!")
+             f"📉 Histórico: menor {reais(min(precos))} · maior {reais(max(precos))} · {len(precos)} preços registrados\n")
+    if oferta.get("cupom"):
+        texto += f"🎟️ Cupom: <code>{html.escape(oferta['cupom'])}</code>\n"
+    texto += f"🔒 Link testado: {html.escape(laudo)}\n✅ Loja conhecida e abaixo do preço que vocês querem pagar. Corre!"
     botoes = [{"text": f"🛒 Comprar na {oferta['loja']}", "url": oferta["link"]}]
     if grafico(hist):
         botoes.append({"text": "📈 Histórico de preços", "url": grafico(hist)})
     fields = {"chat_id": TELEGRAM_CHAT_ID, "caption": texto[:1024], "parse_mode": "HTML",
               "reply_markup": json.dumps({"inline_keyboard": [botoes]})}
-    # foto do produto primeiro: Zoom e Amazon bloqueiam navegador automático e o print sairia como "403 ERROR"
-    png = None if oferta.get("foto") else print_oferta(oferta["link"])
-    if oferta.get("foto"):
-        telegram("sendPhoto", {**fields, "photo": oferta["foto"]})
-    elif png:
-        telegram("sendPhoto", fields, {"photo": ("produto.png", png)})
-    else:
-        telegram("sendMessage", {k: v for k, v in fields.items() if k != "caption"} | {"text": fields["caption"]})
+    enviar_com_imagem(fields, oferta["link"], oferta.get("foto"))
 
 
 def monitorar(estado):
-    """Vigia modelos específicos e avisa (marcando todos) quando alguma loja confiável fica abaixo do alvo. Sem IA.
+    """Vigia produtos específicos em várias fontes e avisa (marcando todos) quando uma loja conhecida fica
+    abaixo do alvo. Sem IA.
 
-    Cada alvo é {"nome", "max"} mais "url" (página da Amazon) ou "busca" (código do modelo no Zoom, com "excluir"
-    para cores que não servem).
+    Cada alvo: {"nome", "max", "excluir": [...], "modelos": [códigos no Zoom/Buscapé],
+                "promobit": {"q", "todos": [...], "algum": [...]}, "amazon": [urls]}
     """
     hoje = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     for alvo in MONITORES:
-        chave = alvo.get("url") or alvo["busca"]
-        info = estado.setdefault("monitores", {}).setdefault(chave, {"alertado": {}, "historico": []})
-        if not isinstance(info.get("alertado"), dict):
-            info["alertado"] = {}  # formato antigo: um preço só
-        ofertas = ofertas_amazon(alvo) if "url" in alvo else ofertas_zoom(alvo)
+        info = estado.setdefault("monitores", {}).setdefault(alvo["nome"], {"alertado": {}, "historico": []})
+        ofertas, fontes = [], []
+        for fonte in (ofertas_comparadores, ofertas_promobit, ofertas_amazon):
+            try:  # uma fonte fora do ar não derruba as outras
+                achadas = fonte(alvo)
+            except Exception as e:
+                print(f"monitor '{alvo['nome']}': {fonte.__name__} falhou: {e}")
+                achadas = []
+            ofertas += achadas
+            fontes.append(f"{fonte.__name__.removeprefix('ofertas_')}={len(achadas)}")
         if not ofertas:
-            print(f"monitor {alvo['nome']}: nenhuma oferta confiável agora")
+            print(f"monitor {alvo['nome']}: nenhuma oferta em loja conhecida agora ({', '.join(fontes)})")
             continue
-        melhor = min(o["preco"] for o in ofertas)
-        print(f"monitor {alvo['nome']}: menor {reais(melhor)} em {len(ofertas)} oferta(s) (alvo {reais(alvo['max'])})")
+        melhor = min(ofertas, key=lambda o: o["preco"])
+        print(f"monitor {alvo['nome']}: menor {reais(melhor['preco'])} na {melhor['loja']} "
+              f"(alvo {reais(alvo['max'])}; {', '.join(fontes)})")
         hist = info["historico"]
-        if not hist or hist[-1][0] != hoje or hist[-1][1] != melhor:
-            hist.append([hoje, melhor, alvo["nome"]])
+        if not hist or hist[-1][0] != hoje or hist[-1][1] != melhor["preco"]:
+            hist.append([hoje, melhor["preco"], alvo["nome"]])
             info["historico"] = hist[-100:]
         por_loja = {}
         for o in ofertas:  # vários anúncios na mesma loja: vale o mais barato
             if o["loja"] not in por_loja or o["preco"] < por_loja[o["loja"]]["preco"]:
                 por_loja[o["loja"]] = o
+        for loja in list(info["alertado"]):
+            if loja not in por_loja or por_loja[loja]["preco"] >= alvo["max"]:
+                del info["alertado"][loja]  # subiu ou sumiu: a próxima queda avisa de novo
         for loja, oferta in por_loja.items():
             ja_avisado = info["alertado"].get(loja)
-            if oferta["preco"] >= alvo["max"]:
-                info["alertado"].pop(loja, None)  # voltou a subir: o próximo mergulho avisa de novo
-                continue
-            if ja_avisado is not None and oferta["preco"] >= ja_avisado - 1:
-                continue  # já avisamos esse preço nessa loja; só avisa de novo se cair mais
+            if oferta["preco"] >= alvo["max"] or (ja_avisado is not None and oferta["preco"] >= ja_avisado - 1):
+                continue  # acima do alvo, ou já avisamos esse preço nessa loja
             try:
                 alertar(alvo, oferta, hist)
                 info["alertado"][loja] = oferta["preco"]
@@ -360,9 +491,8 @@ def monitorar(estado):
                 print(f"alerta de '{alvo['nome']}' ({loja}) falhou: {e}")
 
 
-def main():
-    primeira_vez = not os.path.exists(ESTADO)
-    estado = {"vistos": [], "historico": {}} if primeira_vez else json.load(open(ESTADO, encoding="utf-8"))
+def rodar_lista(estado, primeira_vez):
+    """Promoções do Promobit para os itens pendentes da planilha, avaliadas pelo Claude."""
     vistos = set(estado["vistos"])
     enviados = set(estado.get("enviados", []))
     agora = datetime.now(timezone.utc)
@@ -405,14 +535,52 @@ def main():
                 except Exception as e:  # uma oferta com problema não impede as outras
                     print(f"envio da oferta {r['id']} falhou: {e}")
     vistos.update(ofertas)  # avaliadas uma vez só, para não gastar token de novo
-
-    monitorar(estado)
     estado["vistos"] = sorted(vistos)[-3000:]
     estado["enviados"] = sorted(enviados)[-1000:]
+
+
+FALHAS_ATE_AVISAR = 3  # ~30 min seguidos de erro antes de incomodar o grupo
+
+
+def avisar_saude(estado, erros):
+    """Avisa no grupo quando o radar fica quebrado por várias rodadas, e de novo quando volta."""
+    if erros:
+        estado["falhas"] = estado.get("falhas", 0) + 1
+        if estado["falhas"] == FALHAS_ATE_AVISAR:
+            detalhe = html.escape(" | ".join(erros))[:600]
+            telegram("sendMessage", {"chat_id": TELEGRAM_CHAT_ID,
+                                     "text": f"⚠️ O radar está com problema há {FALHAS_ATE_AVISAR} rodadas seguidas:\n{detalhe}"})
+    else:
+        if estado.get("falhas", 0) >= FALHAS_ATE_AVISAR:
+            telegram("sendMessage", {"chat_id": TELEGRAM_CHAT_ID, "text": "✅ O radar voltou ao normal."})
+        estado["falhas"] = 0
+
+
+def main():
+    try:
+        estado = json.load(open(ESTADO, encoding="utf-8"))
+        primeira_vez = False
+    except (OSError, ValueError):  # sem estado, ou arquivo corrompido: recomeça do zero
+        estado, primeira_vez = {}, True
+    estado.setdefault("vistos", [])
+    estado.setdefault("historico", {})
+
+    erros = []
+    for nome, etapa in (("lista de compras", lambda: rodar_lista(estado, primeira_vez)),
+                        ("monitor de preço alvo", lambda: monitorar(estado))):
+        try:  # uma etapa quebrada não impede a outra
+            etapa()
+        except Exception as e:
+            traceback.print_exc()
+            erros.append(f"{nome}: {e}")
+    try:
+        avisar_saude(estado, erros)
+    except Exception as e:
+        print(f"aviso de saúde falhou: {e}")
     with open(ESTADO, "w", encoding="utf-8") as f:
         json.dump(estado, f, ensure_ascii=False, indent=1)
-
-
+    if erros:
+        sys.exit(1)
 
 
 def _teste():
@@ -428,10 +596,18 @@ def _teste():
     assert r["mediana"] == 200 and r["desconto_vs_mediana_pct"] == 50 and r["e_o_menor_ja_visto"]
     assert preco_amazon('x "priceAmount":1899.00,"y"') == 1899.0 and preco_amazon("sem preço") is None
     assert reais(1599.9) == "R$ 1.599,90"
-    assert confiavel("Magazine Luiza") and confiavel("Fast Shop") and not confiavel("Loja do Zé")
+    assert confiavel("Magazine Luiza") and confiavel("Midea ") and not confiavel("Webcontinental")
+    assert dominio_confiavel("www.amazon.com.br") and not dominio_confiavel("amazon.com.br.golpe.xyz")
+    assert testar_link("http://www.amazon.com.br/dp/X")[0] is False  # sem HTTPS
+    assert testar_link("https://amaz0n-ofertas.xyz/dp/X")[0] is False  # domínio desconhecido
+    alvo = {"excluir": ["branc", "220", "kit"]}
+    assert serve("Lava Louças 8 Serviços Preta Touch Plus Midea 127v", alvo)
+    assert not serve("Lava Louças 8 Serviços Branca Touch Plus Midea", alvo)
+    assert not serve("Lava Louças 8 Serviços Cinza Touch Plus Midea 220V", alvo)
+    assert bloqueio_na_pagina(403, "") and bloqueio_na_pagina(200, "403 ERROR The request could not be satisfied")
+    assert not bloqueio_na_pagina(200, "Robô Aspirador Xiaomi por R$ 999")
     print("testes ok")
 
 
 if __name__ == "__main__":
-    import sys
     _teste() if "--teste" in sys.argv else main()
