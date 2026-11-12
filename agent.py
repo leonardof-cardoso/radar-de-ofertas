@@ -383,7 +383,11 @@ def ofertas_comparadores(alvo):
             loja = h.get("merchantName") or (h.get("bestOffer") or {}).get("merchantName")
             # só anúncio de loja ("offer"): a página agrupada do comparador ("product") mistura as cores
             # e mostra o preço da mais barata, que pode ser a branca
-            if (h.get("type") != "offer" or normalizar(modelo) not in normalizar(h.get("name", ""))
+            # "agrupada": true no alvo aceita a página agrupada, para produto que só existe em uma cor
+            tipos = ("offer", "product") if alvo.get("agrupada") else ("offer",)
+            nome = normalizar(h.get("name", ""))
+            # ponytail: cada palavra da busca precisa estar no título (substring); "excluir" corta o resto
+            if (h.get("type") not in tipos or not all(p in nome for p in normalizar(modelo).split())
                     or not serve(h["name"], alvo) or not confiavel(loja)):
                 continue
             encontradas.append({"loja": loja, "preco": float(h["price"]), "titulo": h["name"],
