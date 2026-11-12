@@ -310,11 +310,12 @@ def alertar(alvo, oferta, hist):
         botoes.append({"text": "📈 Histórico de preços", "url": grafico(hist)})
     fields = {"chat_id": TELEGRAM_CHAT_ID, "caption": texto[:1024], "parse_mode": "HTML",
               "reply_markup": json.dumps({"inline_keyboard": [botoes]})}
-    png = print_oferta(oferta["link"])
-    if png:
-        telegram("sendPhoto", fields, {"photo": ("produto.png", png)})
-    elif oferta.get("foto"):
+    # foto do produto primeiro: Zoom e Amazon bloqueiam navegador automático e o print sairia como "403 ERROR"
+    png = None if oferta.get("foto") else print_oferta(oferta["link"])
+    if oferta.get("foto"):
         telegram("sendPhoto", {**fields, "photo": oferta["foto"]})
+    elif png:
+        telegram("sendPhoto", fields, {"photo": ("produto.png", png)})
     else:
         telegram("sendMessage", {k: v for k, v in fields.items() if k != "caption"} | {"text": fields["caption"]})
 
