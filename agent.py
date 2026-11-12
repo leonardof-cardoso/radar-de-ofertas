@@ -25,9 +25,12 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 _mencoes = [m.strip() for m in os.environ.get("MENCOES", "").split(",") if m.strip()]
 MENCOES = [m.split(":", 1) for m in _mencoes if ":" in m]
 USERNAMES = [m for m in _mencoes if m.startswith("@")]
+# Produtos vigiados direto na loja: [{"nome": "...", "url": "https://www.amazon.com.br/dp/ASIN", "max": 1600}]
+MONITORES = json.loads(os.environ.get("MONITORES") or "[]")
 
 ESTADO = "estado.json"
-UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130 Safari/537.36"}
+UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130 Safari/537.36",
+      "Accept-Language": "pt-BR,pt;q=0.9"}
 MAX_IDADE = timedelta(days=3)
 
 SYSTEM = """Você filtra ofertas do Promobit para um casal montando a casa nova no Brasil.
@@ -163,7 +166,8 @@ def print_oferta(url):
         with sync_playwright() as p:
             browser = p.chromium.launch(channel="chrome")  # Chrome já vem instalado no runner do GitHub
             page = browser.new_page(viewport={"width": 430, "height": 820}, device_scale_factor=2, locale="pt-BR")
-            page.goto(url, wait_until="networkidle", timeout=45000)
+            page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            page.wait_for_timeout(4000)  # deixa imagens e preço aparecerem
             png = page.screenshot()
             browser.close()
             return png
@@ -209,15 +213,18 @@ def grafico(historico):
     return "https://quickchart.io/chart?c=" + urllib.parse.quote(json.dumps(config, separators=(",", ":")))
 
 
+def marcar_todos():
+    marcas = " ".join(f'<a href="tg://user?id={uid}">{html.escape(nome)}</a>' for uid, nome in MENCOES)
+    return marcas + "".join(f" {m}" for m in USERNAMES)
+
+
 def enviar(oferta, mensagem, super_promo, historico):
     link = f"https://www.promobit.com.br/oferta/{oferta['offer_slug']}/"
     texto = html.escape(mensagem)
     if oferta.get("offer_coupon"):
         texto += f"\n🎟️ Cupom: <code>{html.escape(oferta['offer_coupon'])}</code>"
     if super_promo:
-        marcas = " ".join(f'<a href="tg://user?id={uid}">{html.escape(nome)}</a>' for uid, nome in MENCOES)
-        marcas += "".join(f" {m}" for m in USERNAMES)
-        texto = f"🚨🚨 SUPER PROMOÇÃO 🚨🚨 {marcas}\n\n" + texto
+        texto = f"🚨🚨 SUPER PROMOÇÃO 🚨🚨 {marcar_todos()}\n\n" + texto
     botoes = [{"text": "🛒 Ver oferta", "url": link}]
     if grafico(historico):
         botoes.append({"text": "📈 Histórico de preços", "url": grafico(historico)})
@@ -228,6 +235,67 @@ def enviar(oferta, mensagem, super_promo, historico):
         telegram("sendPhoto", fields, {"photo": ("oferta.png", png)})
     else:
         telegram("sendPhoto", {**fields, "photo": "https://i.promobit.com.br/400" + oferta["offer_photo"]})
+
+
+def preco_amazon(pagina):
+    """Preço atual de uma página de produto da Amazon, ou None se indisponível."""
+    m = re.search(r'"priceAmount":([\d.]+)', pagina)
+    return float(m.group(1)) if m else None
+
+
+def reais(valor):
+    return f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def monitorar(estado):
+    """Vigia produtos direto na loja e avisa (marcando todos) quando o preço fica abaixo do alvo. Sem IA."""
+    hoje = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    for alvo in MONITORES:
+        info = estado.setdefault("monitores", {}).setdefault(alvo["url"], {"alertado": None, "historico": []})
+        pagina = None
+        for tentativa in range(4):  # a Amazon às vezes responde 503 para robôs: tenta de novo
+            try:
+                pagina = get(alvo["url"])
+                break
+            except Exception as e:
+                print(f"monitor '{alvo['nome']}' tentativa {tentativa + 1} falhou: {e}")
+                time.sleep(5 * (tentativa + 1))
+        if pagina is None:
+            continue
+        preco = preco_amazon(pagina)
+        print(f"monitor {alvo['nome']}: {reais(preco) if preco else 'indisponível'} (alvo {reais(alvo['max'])})")
+        if preco is None:
+            continue
+        hist = info["historico"]
+        if not hist or hist[-1][1] != preco:
+            hist.append([hoje, preco, alvo["nome"]])
+            info["historico"] = hist[-100:]
+        if preco >= alvo["max"]:
+            info["alertado"] = None  # voltou a subir: o próximo mergulho avisa de novo
+            continue
+        if info["alertado"] is not None and preco >= info["alertado"] - 1:
+            continue  # já avisamos esse preço; só avisa de novo se cair mais
+        precos = [p for _, p, _ in hist]
+        texto = (f"🚨🎯 PREÇO ALVO ATINGIDO 🎯🚨 {marcar_todos()}\n\n"
+                 f"🔥 {html.escape(alvo['nome'])}\n"
+                 f"💰 Agora: <b>{reais(preco)}</b> na Amazon (alvo: abaixo de {reais(alvo['max'])})\n"
+                 f"📉 Histórico: menor {reais(min(precos))} · maior {reais(max(precos))} · {len(precos)} preços registrados\n"
+                 f"✅ Corre que está abaixo do preço que vocês querem pagar!")
+        botoes = [{"text": "🛒 Comprar na Amazon", "url": alvo["url"]}]
+        if grafico(hist):
+            botoes.append({"text": "📈 Histórico de preços", "url": grafico(hist)})
+        fields = {"chat_id": TELEGRAM_CHAT_ID, "caption": texto[:1024], "parse_mode": "HTML",
+                  "reply_markup": json.dumps({"inline_keyboard": [botoes]})}
+        try:
+            png = print_oferta(alvo["url"])
+            if png:
+                telegram("sendPhoto", fields, {"photo": ("produto.png", png)})
+            else:
+                foto = re.search(r'data-old-hires="([^"]+)"', pagina)
+                telegram("sendPhoto", {**fields, "photo": foto.group(1)} if foto else fields)
+            info["alertado"] = preco
+        except Exception as e:
+            print(f"alerta de '{alvo['nome']}' falhou: {e}")
 
 
 def main():
@@ -276,6 +344,7 @@ def main():
                     print(f"envio da oferta {r['id']} falhou: {e}")
     vistos.update(ofertas)  # avaliadas uma vez só, para não gastar token de novo
 
+    monitorar(estado)
     estado["vistos"] = sorted(vistos)[-3000:]
     estado["enviados"] = sorted(enviados)[-1000:]
     with open(ESTADO, "w", encoding="utf-8") as f:
@@ -295,6 +364,8 @@ def _teste():
     assert grafico([["2026-10-01", 100, "x"], ["2026-10-02", 90, "x"]]).startswith("https://quickchart.io/")
     r = resumo([["2026-10-01", 100, "a"], ["2026-10-02", 200, "b"], ["2026-10-03", 300, "c"]], 100)
     assert r["mediana"] == 200 and r["desconto_vs_mediana_pct"] == 50 and r["e_o_menor_ja_visto"]
+    assert preco_amazon('x "priceAmount":1899.00,"y"') == 1899.0 and preco_amazon("sem preço") is None
+    assert reais(1599.9) == "R$ 1.599,90"
     print("testes ok")
 
 

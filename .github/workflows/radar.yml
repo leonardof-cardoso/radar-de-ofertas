@@ -33,6 +33,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           SHEET_CSV_URL: ${{ secrets.SHEET_CSV_URL }}
           MENCOES: ${{ secrets.MENCOES }}
+          MONITORES: ${{ secrets.MONITORES }}
       - uses: actions/cache/save@v4
         if: always()
         with:
