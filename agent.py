@@ -247,55 +247,116 @@ def reais(valor):
     return f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
+# Só alerta de lojas grandes e conhecidas (nome como aparece no Zoom/Buscapé, sem acento e minúsculo).
+LOJAS_CONFIAVEIS = {
+    "amazon", "magazine luiza", "magalu", "fast shop", "webcontinental", "casas bahia", "ponto", "extra",
+    "carrefour", "americanas", "submarino", "shoptime", "mercado livre", "leroy merlin", "kabum",
+    "midea", "loja midea", "polishop", "colombo", "lojas colombo", "havan", "girafa", "fujioka",
+}
+
+
+def confiavel(loja):
+    return normalizar(loja or "") in LOJAS_CONFIAVEIS
+
+
+def get_com_retry(url, nome):
+    for tentativa in range(4):  # lojas às vezes respondem 503 para robôs: tenta de novo
+        try:
+            return get(url)
+        except Exception as e:
+            print(f"monitor '{nome}' tentativa {tentativa + 1} falhou: {e}")
+            time.sleep(5 * (tentativa + 1))
+    return None
+
+
+def ofertas_amazon(alvo):
+    pagina = get_com_retry(alvo["url"], alvo["nome"])
+    preco = preco_amazon(pagina) if pagina else None
+    if preco is None:
+        return []
+    foto = re.search(r'data-old-hires="([^"]+)"', pagina)
+    return [{"loja": "Amazon", "preco": preco, "link": alvo["url"], "foto": foto and foto.group(1)}]
+
+
+def ofertas_zoom(alvo):
+    """Todas as ofertas do modelo no Zoom (agrega dezenas de lojas), já sem cor proibida e só de loja confiável."""
+    pagina = get_com_retry("https://www.zoom.com.br/search?q=" + urllib.parse.quote(alvo["busca"]), alvo["nome"])
+    if not pagina:
+        return []
+    m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', pagina, re.S)
+    hits = json.loads(m.group(1))["props"]["initialReduxState"]["hits"]["hits"] if m else []
+    proibidas = [normalizar(p) for p in alvo.get("excluir", [])]
+    encontradas = []
+    for h in hits:
+        nome = normalizar(h.get("name", ""))
+        loja = h.get("merchantName") or (h.get("bestOffer") or {}).get("merchantName")
+        if normalizar(alvo["busca"]) not in nome or any(p in nome for p in proibidas) or not confiavel(loja):
+            continue
+        encontradas.append({"loja": loja, "preco": float(h["price"]), "titulo": h["name"],
+                            "link": "https://www.zoom.com.br" + h["url"], "foto": h.get("image")})
+    return encontradas
+
+
+def alertar(alvo, oferta, hist):
+    precos = [p for _, p, _ in hist]
+    texto = (f"🚨🎯 PREÇO ALVO ATINGIDO 🎯🚨 {marcar_todos()}\n\n"
+             f"🔥 {html.escape(oferta.get('titulo') or alvo['nome'])}\n"
+             f"💰 Agora: <b>{reais(oferta['preco'])}</b> na {html.escape(oferta['loja'])} "
+             f"(alvo: abaixo de {reais(alvo['max'])})\n"
+             f"📉 Histórico: menor {reais(min(precos))} · maior {reais(max(precos))} · {len(precos)} preços registrados\n"
+             f"✅ Loja confiável e abaixo do preço que vocês querem pagar. Corre!")
+    botoes = [{"text": f"🛒 Comprar na {oferta['loja']}", "url": oferta["link"]}]
+    if grafico(hist):
+        botoes.append({"text": "📈 Histórico de preços", "url": grafico(hist)})
+    fields = {"chat_id": TELEGRAM_CHAT_ID, "caption": texto[:1024], "parse_mode": "HTML",
+              "reply_markup": json.dumps({"inline_keyboard": [botoes]})}
+    png = print_oferta(oferta["link"])
+    if png:
+        telegram("sendPhoto", fields, {"photo": ("produto.png", png)})
+    elif oferta.get("foto"):
+        telegram("sendPhoto", {**fields, "photo": oferta["foto"]})
+    else:
+        telegram("sendMessage", {k: v for k, v in fields.items() if k != "caption"} | {"text": fields["caption"]})
+
+
 def monitorar(estado):
-    """Vigia produtos direto na loja e avisa (marcando todos) quando o preço fica abaixo do alvo. Sem IA."""
+    """Vigia modelos específicos e avisa (marcando todos) quando alguma loja confiável fica abaixo do alvo. Sem IA.
+
+    Cada alvo é {"nome", "max"} mais "url" (página da Amazon) ou "busca" (código do modelo no Zoom, com "excluir"
+    para cores que não servem).
+    """
     hoje = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     for alvo in MONITORES:
-        info = estado.setdefault("monitores", {}).setdefault(alvo["url"], {"alertado": None, "historico": []})
-        pagina = None
-        for tentativa in range(4):  # a Amazon às vezes responde 503 para robôs: tenta de novo
-            try:
-                pagina = get(alvo["url"])
-                break
-            except Exception as e:
-                print(f"monitor '{alvo['nome']}' tentativa {tentativa + 1} falhou: {e}")
-                time.sleep(5 * (tentativa + 1))
-        if pagina is None:
+        chave = alvo.get("url") or alvo["busca"]
+        info = estado.setdefault("monitores", {}).setdefault(chave, {"alertado": {}, "historico": []})
+        if not isinstance(info.get("alertado"), dict):
+            info["alertado"] = {}  # formato antigo: um preço só
+        ofertas = ofertas_amazon(alvo) if "url" in alvo else ofertas_zoom(alvo)
+        if not ofertas:
+            print(f"monitor {alvo['nome']}: nenhuma oferta confiável agora")
             continue
-        preco = preco_amazon(pagina)
-        print(f"monitor {alvo['nome']}: {reais(preco) if preco else 'indisponível'} (alvo {reais(alvo['max'])})")
-        if preco is None:
-            continue
+        melhor = min(o["preco"] for o in ofertas)
+        print(f"monitor {alvo['nome']}: menor {reais(melhor)} em {len(ofertas)} oferta(s) (alvo {reais(alvo['max'])})")
         hist = info["historico"]
-        if not hist or hist[-1][1] != preco:
-            hist.append([hoje, preco, alvo["nome"]])
+        if not hist or hist[-1][0] != hoje or hist[-1][1] != melhor:
+            hist.append([hoje, melhor, alvo["nome"]])
             info["historico"] = hist[-100:]
-        if preco >= alvo["max"]:
-            info["alertado"] = None  # voltou a subir: o próximo mergulho avisa de novo
-            continue
-        if info["alertado"] is not None and preco >= info["alertado"] - 1:
-            continue  # já avisamos esse preço; só avisa de novo se cair mais
-        precos = [p for _, p, _ in hist]
-        texto = (f"🚨🎯 PREÇO ALVO ATINGIDO 🎯🚨 {marcar_todos()}\n\n"
-                 f"🔥 {html.escape(alvo['nome'])}\n"
-                 f"💰 Agora: <b>{reais(preco)}</b> na Amazon (alvo: abaixo de {reais(alvo['max'])})\n"
-                 f"📉 Histórico: menor {reais(min(precos))} · maior {reais(max(precos))} · {len(precos)} preços registrados\n"
-                 f"✅ Corre que está abaixo do preço que vocês querem pagar!")
-        botoes = [{"text": "🛒 Comprar na Amazon", "url": alvo["url"]}]
-        if grafico(hist):
-            botoes.append({"text": "📈 Histórico de preços", "url": grafico(hist)})
-        fields = {"chat_id": TELEGRAM_CHAT_ID, "caption": texto[:1024], "parse_mode": "HTML",
-                  "reply_markup": json.dumps({"inline_keyboard": [botoes]})}
-        try:
-            png = print_oferta(alvo["url"])
-            if png:
-                telegram("sendPhoto", fields, {"photo": ("produto.png", png)})
-            else:
-                foto = re.search(r'data-old-hires="([^"]+)"', pagina)
-                telegram("sendPhoto", {**fields, "photo": foto.group(1)} if foto else fields)
-            info["alertado"] = preco
-        except Exception as e:
-            print(f"alerta de '{alvo['nome']}' falhou: {e}")
+        por_loja = {}
+        for o in ofertas:  # vários anúncios na mesma loja: vale o mais barato
+            if o["loja"] not in por_loja or o["preco"] < por_loja[o["loja"]]["preco"]:
+                por_loja[o["loja"]] = o
+        for loja, oferta in por_loja.items():
+            ja_avisado = info["alertado"].get(loja)
+            if oferta["preco"] >= alvo["max"]:
+                info["alertado"].pop(loja, None)  # voltou a subir: o próximo mergulho avisa de novo
+                continue
+            if ja_avisado is not None and oferta["preco"] >= ja_avisado - 1:
+                continue  # já avisamos esse preço nessa loja; só avisa de novo se cair mais
+            try:
+                alertar(alvo, oferta, hist)
+                info["alertado"][loja] = oferta["preco"]
+            except Exception as e:
+                print(f"alerta de '{alvo['nome']}' ({loja}) falhou: {e}")
 
 
 def main():
@@ -366,6 +427,7 @@ def _teste():
     assert r["mediana"] == 200 and r["desconto_vs_mediana_pct"] == 50 and r["e_o_menor_ja_visto"]
     assert preco_amazon('x "priceAmount":1899.00,"y"') == 1899.0 and preco_amazon("sem preço") is None
     assert reais(1599.9) == "R$ 1.599,90"
+    assert confiavel("Magazine Luiza") and confiavel("Fast Shop") and not confiavel("Loja do Zé")
     print("testes ok")
 
 
