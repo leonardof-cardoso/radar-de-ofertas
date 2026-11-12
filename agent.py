@@ -249,7 +249,7 @@ def reais(valor):
 
 # Só alerta de lojas grandes e conhecidas (nome como aparece no Zoom/Buscapé, sem acento e minúsculo).
 LOJAS_CONFIAVEIS = {
-    "amazon", "magazine luiza", "magalu", "fast shop", "webcontinental", "casas bahia", "ponto", "extra",
+    "amazon", "magazine luiza", "magalu", "fast shop", "casas bahia", "ponto", "extra",
     "carrefour", "americanas", "submarino", "shoptime", "mercado livre", "leroy merlin", "kabum",
     "midea", "loja midea", "polishop", "colombo", "lojas colombo", "havan", "girafa", "fujioka",
 }
